@@ -28,6 +28,11 @@ sealed class TrayApp : ApplicationContext
     readonly NotifyIcon _gpuIcon = new() { Visible = true };
     readonly System.Windows.Forms.Timer _timer = new() { Interval = 2000 };
     readonly ToolStripMenuItem _autostartItem;
+    readonly ToolStripMenuItem _alertsItem;
+    readonly Settings _settings = Settings.Load();
+    readonly Alert _cpuAlert = new("CPU");
+    readonly Alert _gpuAlert = new("GPU");
+    readonly Alert _gpuHotAlert = new("GPU Hot Spot");
 
     public TrayApp()
     {
@@ -37,7 +42,13 @@ sealed class TrayApp : ApplicationContext
         {
             Checked = IsAutostartEnabled()
         };
+        _alertsItem = new ToolStripMenuItem("Оповещать о перегреве", null, (_, _) => ToggleAlerts())
+        {
+            Checked = _settings.AlertsEnabled
+        };
         var menu = new ContextMenuStrip();
+        menu.Items.Add(_alertsItem);
+        menu.Items.Add("Пороги оповещений…", null, (_, _) => Settings.OpenInEditor());
         menu.Items.Add(_autostartItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Выход", null, (_, _) => ExitThread());
@@ -80,12 +91,28 @@ sealed class TrayApp : ApplicationContext
             .Select(t => $"{t:0}°")
             .ToList();
 
-        SetIcon(_cpuIcon, cpuTemp, Color.FromArgb(90, 170, 255));
+        _settings.ReloadIfChanged();
+
+        SetIcon(_cpuIcon, cpuTemp, _settings.CpuAlert, Color.FromArgb(90, 170, 255));
         _cpuIcon.Text = Trim($"CPU {cpuTemp:0}°C | {cpuLoad:0}% | {cpuPower:0} W\n{cpu?.Name}");
 
-        SetIcon(_gpuIcon, gpuTemp, Color.FromArgb(120, 220, 120));
+        SetIcon(_gpuIcon, gpuTemp, _settings.GpuAlert, Color.FromArgb(120, 220, 120));
         var ssd = ssdTemps.Count > 0 ? $"\nSSD: {string.Join(" ", ssdTemps)}" : "";
         _gpuIcon.Text = Trim($"GPU {gpuTemp:0}°C (hot spot {gpuHot:0}°) | {gpuLoad:0}% | {gpuPower:0} W{ssd}");
+
+        if (_settings.AlertsEnabled)
+        {
+            _cpuAlert.Check(cpuTemp, _settings.CpuAlert, _cpuIcon);
+            _gpuAlert.Check(gpuTemp, _settings.GpuAlert, _gpuIcon);
+            _gpuHotAlert.Check(gpuHot, _settings.GpuHotSpotAlert, _gpuIcon);
+        }
+    }
+
+    void ToggleAlerts()
+    {
+        _settings.AlertsEnabled = !_settings.AlertsEnabled;
+        _settings.Save();
+        _alertsItem.Checked = _settings.AlertsEnabled;
     }
 
     static float? Find(IHardware? hw, SensorType type, params string[] names)
@@ -109,7 +136,7 @@ sealed class TrayApp : ApplicationContext
     // Всплывающая подсказка трея ограничена 127 символами
     static string Trim(string s) => s.Length > 127 ? s[..127] : s;
 
-    static void SetIcon(NotifyIcon icon, float? temp, Color labelColor)
+    static void SetIcon(NotifyIcon icon, float? temp, float alertAt, Color labelColor)
     {
         int size = System.Windows.Forms.SystemInformation.SmallIconSize.Width;
         using var bmp = new Bitmap(size, size);
@@ -119,11 +146,12 @@ sealed class TrayApp : ApplicationContext
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
 
             string text = temp.HasValue ? Math.Round(temp.Value).ToString("0") : "--";
+            // Красный — порог оповещения достигнут, оранжевый — осталось меньше 15°C
             var color = temp switch
             {
                 null => Color.Gray,
-                >= 85 => Color.FromArgb(255, 70, 70),
-                >= 70 => Color.FromArgb(255, 170, 40),
+                var t when t >= alertAt => Color.FromArgb(255, 70, 70),
+                var t when t >= alertAt - 15 => Color.FromArgb(255, 170, 40),
                 _ => labelColor
             };
 

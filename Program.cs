@@ -14,6 +14,10 @@ static class Program
         using var mutex = new Mutex(true, "Gradusnik_SingleInstance", out bool first);
         if (!first) return;
 
+        Application.ThreadException += (_, e) => Log.Write($"Необработанная ошибка: {e.Exception}");
+        AppDomain.CurrentDomain.UnhandledException += (_, e) => Log.Write($"Необработанная ошибка: {e.ExceptionObject}");
+        Log.Write("Запуск");
+
         ApplicationConfiguration.Initialize();
         Application.Run(new TrayApp());
     }
@@ -33,6 +37,15 @@ sealed class TrayApp : ApplicationContext
     readonly Alert _cpuAlert = new("CPU");
     readonly Alert _gpuAlert = new("GPU");
     readonly Alert _gpuHotAlert = new("GPU Hot Spot");
+
+    // Если датчики не отвечают дольше этого времени, иконки становятся серыми
+    static readonly TimeSpan StaleAfter = TimeSpan.FromSeconds(15);
+    static readonly TimeSpan SlowUpdate = TimeSpan.FromSeconds(3);
+
+    readonly Thread _pollThread;
+    volatile bool _stopping;
+    volatile Sample? _latest;
+    Sample? _shown;
 
     public TrayApp()
     {
@@ -55,17 +68,39 @@ sealed class TrayApp : ApplicationContext
         _cpuIcon.ContextMenuStrip = menu;
         _gpuIcon.ContextMenuStrip = menu;
 
-        _timer.Tick += (_, _) => UpdateSensors();
+        // Опрос датчиков идёт в фоновом потоке: если какой-то датчик завис, трей продолжает отвечать
+        _pollThread = new Thread(PollLoop) { IsBackground = true, Name = "SensorPoll" };
+        _pollThread.Start();
+
+        _timer.Tick += (_, _) => RefreshTray();
         _timer.Start();
-        UpdateSensors();
     }
 
-    void UpdateSensors()
+    void PollLoop()
+    {
+        while (!_stopping)
+        {
+            try
+            {
+                _latest = ReadSensors();
+            }
+            catch (Exception e)
+            {
+                Log.Write($"Ошибка опроса датчиков: {e}");
+            }
+            Thread.Sleep(2000);
+        }
+    }
+
+    Sample ReadSensors()
     {
         foreach (var hw in _computer.Hardware)
         {
+            var sw = Stopwatch.StartNew();
             hw.Update();
             foreach (var sub in hw.SubHardware) sub.Update();
+            if (sw.Elapsed > SlowUpdate)
+                Log.Write($"Медленный опрос: {hw.HardwareType} \"{hw.Name}\" — {sw.Elapsed.TotalSeconds:0.0} с");
         }
 
         var cpu = _computer.Hardware.FirstOrDefault(h => h.HardwareType == HardwareType.Cpu);
@@ -91,22 +126,51 @@ sealed class TrayApp : ApplicationContext
             .Select(t => $"{t:0}°")
             .ToList();
 
-        _settings.ReloadIfChanged();
-
-        SetIcon(_cpuIcon, cpuTemp, _settings.CpuAlert, Color.FromArgb(90, 170, 255));
-        _cpuIcon.Text = Trim($"CPU {cpuTemp:0}°C | {cpuLoad:0}% | {cpuPower:0} W\n{cpu?.Name}");
-
-        SetIcon(_gpuIcon, gpuTemp, _settings.GpuAlert, Color.FromArgb(120, 220, 120));
         var ssd = ssdTemps.Count > 0 ? $"\nSSD: {string.Join(" ", ssdTemps)}" : "";
-        _gpuIcon.Text = Trim($"GPU {gpuTemp:0}°C (hot spot {gpuHot:0}°) | {gpuLoad:0}% | {gpuPower:0} W{ssd}");
+        return new Sample(
+            DateTime.UtcNow,
+            cpuTemp,
+            Trim($"CPU {cpuTemp:0}°C | {cpuLoad:0}% | {cpuPower:0} W\n{cpu?.Name}"),
+            gpuTemp,
+            gpuHot,
+            Trim($"GPU {gpuTemp:0}°C (hot spot {gpuHot:0}°) | {gpuLoad:0}% | {gpuPower:0} W{ssd}"));
+    }
+
+    // Вызывается в потоке интерфейса: только рисует последний готовый замер, сама к датчикам не обращается
+    void RefreshTray()
+    {
+        _settings.ReloadIfChanged();
+        var s = _latest;
+
+        if (s == null || DateTime.UtcNow - s.Time > StaleAfter)
+        {
+            if (_shown != null || s == null)
+            {
+                SetIcon(_cpuIcon, null, _settings.CpuAlert, Color.Gray);
+                SetIcon(_gpuIcon, null, _settings.GpuAlert, Color.Gray);
+                _cpuIcon.Text = _gpuIcon.Text = s == null ? "Gradusnik: читаю датчики…" : "Gradusnik: датчики не отвечают";
+                if (s != null) Log.Write("Датчики не отвечают дольше 15 с");
+                _shown = null;
+            }
+            return;
+        }
+        if (ReferenceEquals(s, _shown)) return;
+        _shown = s;
+
+        SetIcon(_cpuIcon, s.CpuTemp, _settings.CpuAlert, Color.FromArgb(90, 170, 255));
+        _cpuIcon.Text = s.CpuText;
+        SetIcon(_gpuIcon, s.GpuTemp, _settings.GpuAlert, Color.FromArgb(120, 220, 120));
+        _gpuIcon.Text = s.GpuText;
 
         if (_settings.AlertsEnabled)
         {
-            _cpuAlert.Check(cpuTemp, _settings.CpuAlert, _cpuIcon);
-            _gpuAlert.Check(gpuTemp, _settings.GpuAlert, _gpuIcon);
-            _gpuHotAlert.Check(gpuHot, _settings.GpuHotSpotAlert, _gpuIcon);
+            _cpuAlert.Check(s.CpuTemp, _settings.CpuAlert, _cpuIcon);
+            _gpuAlert.Check(s.GpuTemp, _settings.GpuAlert, _gpuIcon);
+            _gpuHotAlert.Check(s.GpuHot, _settings.GpuHotSpotAlert, _gpuIcon);
         }
     }
+
+    sealed record Sample(DateTime Time, float? CpuTemp, string CpuText, float? GpuTemp, float? GpuHot, string GpuText);
 
     void ToggleAlerts()
     {
@@ -215,11 +279,14 @@ sealed class TrayApp : ApplicationContext
     protected override void ExitThreadCore()
     {
         _timer.Stop();
+        _stopping = true;
         _cpuIcon.Visible = false;
         _gpuIcon.Visible = false;
         _cpuIcon.Dispose();
         _gpuIcon.Dispose();
-        _computer.Close();
+        // Закрываем драйвер, только если опрос завершился; зависший поток фоновый и умрёт вместе с процессом
+        if (_pollThread.Join(TimeSpan.FromSeconds(3)))
+            _computer.Close();
         base.ExitThreadCore();
     }
 }

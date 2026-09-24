@@ -12,7 +12,7 @@
 
 - Windows 10/11 x64
 - [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0)
-- Драйвер [PawnIO](https://pawnio.eu/) для датчиков CPU: `winget install namazso.PawnIO`
+- Драйвер [PawnIO](https://github.com/namazso/PawnIO.Setup/releases) для датчиков CPU: `winget install namazso.PawnIO`
 - Права администратора: программа запрашивает их при запуске
 
 ## Сборка
